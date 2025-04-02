@@ -4,6 +4,7 @@ import os
 from ultralytics import YOLO
 from threading import Thread
 import numpy as np
+import time  # Add this import for measuring time
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -24,10 +25,12 @@ def load_model(model_path):
         print(f"Error loading model: {e}")
 
 def detect_fire(frame):
+    global current_model_path
     try:
         results = model.predict(frame, verbose=False)
         detections = results[0].boxes.data.cpu().numpy()
         fire_detected = False
+        smoke_detected = False
 
         for *box, conf, cls in detections:
             if int(cls) == 0:  # Assuming '0' is the class ID for fire
@@ -35,10 +38,16 @@ def detect_fire(frame):
                 x1, y1, x2, y2 = map(int, box)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
                 cv2.putText(frame, f"Fire: {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        return frame, fire_detected
+            elif int(cls) == 1 and '50epochv11x.pt' in current_model_path:  # Assuming '1' is the class ID for smoke
+                smoke_detected = True
+                x1, y1, x2, y2 = map(int, box)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                cv2.putText(frame, f"Smoke: {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+        return frame, fire_detected, smoke_detected
     except Exception as e:
         print(f"Error in detect_fire: {e}")
-        return frame, False
+        return frame, False, False
 
 def process_video(input_source):
     global output_frame, stop_thread
@@ -50,7 +59,8 @@ def process_video(input_source):
 
     frame_skip = 2
     frame_count = 0
-    
+    prev_time = time.time()  # Initialize time for FPS calculation
+
     print("Video capture started")
     while not stop_thread:
         ret, frame = cap.read()
@@ -62,8 +72,18 @@ def process_video(input_source):
         if frame_count % frame_skip != 0:
             continue
 
+        start_time = time.time()  # Start time for processing
         frame = cv2.resize(frame, (640, 360))
-        processed_frame, _ = detect_fire(frame)
+        processed_frame, fire_detected, smoke_detected = detect_fire(frame)
+        end_time = time.time()  # End time for processing
+
+        # Calculate real-time FPS
+        fps = 1 / (end_time - prev_time)
+        prev_time = end_time
+
+        # Add FPS counter to the frame
+        cv2.putText(processed_frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         output_frame = processed_frame
 
     cap.release()
