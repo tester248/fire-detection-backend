@@ -16,6 +16,10 @@ stop_thread = False
 model = None
 current_model_path = 'models/v8n50epoch.pt'
 
+# Global variables for JSON response
+fire_confidence = 0.0
+smoke_detected_status = False
+
 def load_model(model_path):
     global model
     try:
@@ -25,28 +29,37 @@ def load_model(model_path):
         print(f"Error loading model: {e}")
 
 def detect_fire(frame):
-    global current_model_path
+    global current_model_path, fire_confidence, smoke_detected_status
     try:
         results = model.predict(frame, verbose=False)
         detections = results[0].boxes.data.cpu().numpy()
         fire_detected = False
-        smoke_detected = False
+        smoke_detected_status = False
+        total_confidence = 0
+        fire_count = 0
 
         for *box, conf, cls in detections:
             if int(cls) == 0:  # Assuming '0' is the class ID for fire
                 fire_detected = True
+                fire_count += 1
+                total_confidence += conf
                 x1, y1, x2, y2 = map(int, box)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
                 cv2.putText(frame, f"Fire: {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
             elif int(cls) == 1 and '50epochv11x.pt' in current_model_path:  # Assuming '1' is the class ID for smoke
-                smoke_detected = True
+                smoke_detected_status = True
                 x1, y1, x2, y2 = map(int, box)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
                 cv2.putText(frame, f"Smoke: {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-        return frame, fire_detected, smoke_detected
+        # Calculate average confidence for fire detection
+        fire_confidence = (total_confidence / fire_count) * 100 if fire_count > 0 else 0.0
+
+        return frame, fire_detected, smoke_detected_status
     except Exception as e:
         print(f"Error in detect_fire: {e}")
+        fire_confidence = 0.0
+        smoke_detected_status = False
         return frame, False, False
 
 def process_video(input_source):
@@ -81,8 +94,9 @@ def process_video(input_source):
         fps = 1 / (end_time - prev_time)
         prev_time = end_time
 
-        # Add FPS counter to the frame
+        # Add FPS counter and fire confidence to the frame
         cv2.putText(processed_frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(processed_frame, f"Fire Confidence: {fire_confidence:.2f}%", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         output_frame = processed_frame
 
@@ -204,6 +218,15 @@ def stop_detection():
     if video_thread and video_thread.is_alive():
         video_thread.join()
     return "Fire detection stopped!"
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    global fire_confidence, smoke_detected_status
+    return jsonify({
+        "fire_confidence": fire_confidence,
+        "smoke_detected": smoke_detected_status,
+        "output_frame_available": output_frame is not None
+    })
 
 if __name__ == "__main__":
     load_model(current_model_path)
