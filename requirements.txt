@@ -1,8 +1,12 @@
 flask
 opencv-python
 numpy
+scikit-learn
+joblib
 torch
 torchvision
 ultralytics<=8.3.40
 supervision 
 roboflow
+python-dotenv
+firebase-admin

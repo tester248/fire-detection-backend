@@ -5,7 +5,26 @@ from ultralytics import YOLO
 from threading import Thread
 import numpy as np
 import time  # Add this import for measuring time
+from dotenv import load_dotenv
+import joblib
+import firebase_admin
+from firebase_admin import credentials, db
+import pandas as pd
 
+# Load environment variables from .env file
+load_dotenv()
+
+# Get the Firebase key path from the environment variable
+firebase_key_path = os.getenv("FIREBASE_KEY_PATH")
+
+# Initialize Firebase Admin SDK
+if firebase_key_path:
+    cred = credentials.Certificate(firebase_key_path)
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://fire-detection-system-29797-default-rtdb.asia-southeast1.firebasedatabase.app/'  # Replace with your Firebase Realtime Database URL
+    })
+else:
+    raise ValueError("FIREBASE_KEY_PATH environment variable not set.")
 # Initialize Flask app
 app = Flask(__name__)
 
@@ -14,6 +33,8 @@ output_frame = None
 video_thread = None
 stop_thread = False
 model = None
+# Load the trained sensor model
+sensor_model = joblib.load('models/sensor_fire_model.pkl')
 current_model_path = 'models/v8n50epoch.pt'
 
 # Global variables for JSON response
@@ -94,9 +115,16 @@ def process_video(input_source):
         fps = 1 / (end_time - prev_time)
         prev_time = end_time
 
-        # Add FPS counter and fire confidence to the frame
+        # Fetch live sensor data from Firebase
+        sensor_data = fetch_sensor_data()
+        sensor_confidence = 0.0
+        if sensor_data:
+            sensor_confidence = calculate_sensor_confidence(sensor_data)
+
+        # Add FPS counter, fire confidence, and sensor confidence to the frame
         cv2.putText(processed_frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(processed_frame, f"Fire Confidence: {fire_confidence:.2f}%", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(processed_frame, f"Sensor Confidence: {sensor_confidence:.2f}%", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
         output_frame = processed_frame
 
@@ -219,14 +247,84 @@ def stop_detection():
         video_thread.join()
     return "Fire detection stopped!"
 
+
+def fetch_sensor_data():
+    """
+    Fetch the latest sensor readings from Firebase Realtime Database.
+    :return: Dictionary with sensor readings
+    """
+    try:
+        # Replace 'sensor_data/latest' with the correct path in your Firebase database
+        ref = db.reference('sensors')  # Adjust the path as per your Firebase structure
+        sensor_data = ref.get()
+
+        print("Fetched sensor data from Firebase:")
+        print(sensor_data)
+        # Ensure the data is in the expected format
+        if sensor_data:
+            return {
+                "co": sensor_data.get("co", 0.0),
+                "humidity": sensor_data.get("humidity", 0.0),
+                "lpg": sensor_data.get("lpg", 0.0),
+                "smoke": sensor_data.get("smoke", 0.0),
+                "temp": sensor_data.get("temperature", 0.0)
+            }
+        else:
+            print("No sensor data found in Firebase.")
+            return None
+    except Exception as e:
+        print(f"Error fetching sensor data from Firebase: {e}")
+        return None
+
+
+
+
+def calculate_sensor_confidence(sensor_data):
+    """
+    Calculate fire confidence based on sensor readings using the trained model.
+    :param sensor_data: Dictionary with keys 'co', 'humidity', 'lpg', 'smoke', 'temp'
+    :return: Confidence percentage (0-100)
+    """
+    # Create a DataFrame with the same column names as the training data
+    feature_names = ['co', 'humidity', 'lpg', 'smoke', 'temp']  # Ensure these match the training data
+    features = pd.DataFrame([[
+        sensor_data['co'],
+        sensor_data['humidity'],
+        sensor_data['lpg'],
+        sensor_data['smoke'],
+        sensor_data['temp']
+    ]], columns=feature_names)
+
+    # Predict fire confidence
+    confidence = sensor_model.predict_proba(features)[0][1] * 100  # Probability of fire
+    return confidence
+
 @app.route('/status', methods=['GET'])
 def get_status():
     global fire_confidence, smoke_detected_status
-    return jsonify({
-        "fire_confidence": fire_confidence,
-        "smoke_detected": smoke_detected_status,
-        "output_frame_available": output_frame is not None
-    })
+
+    # Fetch live sensor data from Firebase
+    sensor_data = fetch_sensor_data()
+
+    if sensor_data:
+        # Calculate sensor confidence using the trained model
+        sensor_confidence = calculate_sensor_confidence(sensor_data)
+
+        # Adjusted confidence (weighted average)
+        adjusted_confidence = (fire_confidence * 0.7) + (sensor_confidence * 0.3)
+
+        return jsonify({
+            "fire_confidence": fire_confidence,
+            "sensor_confidence": sensor_confidence,
+            "adjusted_confidence": adjusted_confidence,
+            "smoke_detected": smoke_detected_status,
+            "output_frame_available": output_frame is not None
+        })
+    else:
+        return jsonify({
+            "error": "Unable to fetch sensor data from Firebase."
+        }), 500
+
 
 if __name__ == "__main__":
     load_model(current_model_path)
