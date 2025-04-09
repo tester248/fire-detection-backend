@@ -10,6 +10,7 @@ import joblib
 import firebase_admin
 from firebase_admin import credentials, db
 import pandas as pd
+from flask_cors import CORS  # Add this import
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,6 +28,7 @@ else:
     raise ValueError("FIREBASE_KEY_PATH environment variable not set.")
 # Initialize Flask app
 app = Flask(__name__)
+CORS(app)  # Enable CORS for the Flask app
 
 # Global variables
 output_frame = None
@@ -61,17 +63,31 @@ def detect_fire(frame):
 
         for *box, conf, cls in detections:
             if int(cls) == 0:  # Assuming '0' is the class ID for fire
-                fire_detected = True
-                fire_count += 1
-                total_confidence += conf
-                x1, y1, x2, y2 = map(int, box)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                cv2.putText(frame, f"Fire: {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-            elif int(cls) == 1 and '50epochv11x.pt' in current_model_path:  # Assuming '1' is the class ID for smoke
-                smoke_detected_status = True
-                x1, y1, x2, y2 = map(int, box)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                cv2.putText(frame, f"Smoke: {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                if 'best.pt' in current_model_path:  # Flip annotations for best.pt
+                    smoke_detected_status = True
+                    x1, y1, x2, y2 = map(int, box)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    cv2.putText(frame, f"Smoke: {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                else:
+                    fire_detected = True
+                    fire_count += 1
+                    total_confidence += conf
+                    x1, y1, x2, y2 = map(int, box)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    cv2.putText(frame, f"Fire: {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            elif int(cls) == 1:  # Assuming '1' is the class ID for smoke
+                if 'best.pt' in current_model_path:  # Flip annotations for best.pt
+                    fire_detected = True
+                    fire_count += 1
+                    total_confidence += conf
+                    x1, y1, x2, y2 = map(int, box)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    cv2.putText(frame, f"Fire: {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                else:
+                    smoke_detected_status = True
+                    x1, y1, x2, y2 = map(int, box)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    cv2.putText(frame, f"Smoke: {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
         # Calculate average confidence for fire detection
         fire_confidence = (total_confidence / fire_count) * 100 if fire_count > 0 else 0.0
@@ -258,8 +274,8 @@ def fetch_sensor_data():
         ref = db.reference('sensors')  # Adjust the path as per your Firebase structure
         sensor_data = ref.get()
 
-        print("Fetched sensor data from Firebase:")
-        print(sensor_data)
+        #print("Fetched sensor data from Firebase:")
+        #print(sensor_data)
         # Ensure the data is in the expected format
         if sensor_data:
             return {
@@ -299,30 +315,44 @@ def calculate_sensor_confidence(sensor_data):
     confidence = sensor_model.predict_proba(features)[0][1] * 100  # Probability of fire
     return confidence
 
+
 @app.route('/status', methods=['GET'])
 def get_status():
     global fire_confidence, smoke_detected_status
 
-    # Fetch live sensor data from Firebase
-    sensor_data = fetch_sensor_data()
+    try:
+        # Fetch live sensor data from Firebase
+        sensor_data = fetch_sensor_data()
 
-    if sensor_data:
-        # Calculate sensor confidence using the trained model
-        sensor_confidence = calculate_sensor_confidence(sensor_data)
+        if sensor_data:
+            # Calculate sensor confidence using the trained model
+            sensor_confidence = calculate_sensor_confidence(sensor_data)
 
-        # Adjusted confidence (weighted average)
-        adjusted_confidence = (fire_confidence * 0.7) + (sensor_confidence * 0.3)
+            # Adjusted confidence (weighted average)
+            adjusted_confidence = (fire_confidence * 0.7) + (sensor_confidence * 0.3)
 
+            return jsonify({
+                "fire_confidence": float(fire_confidence),  # Convert to Python float
+                "sensor_confidence": float(sensor_confidence),  # Convert to Python float
+                "adjusted_confidence": float(adjusted_confidence),  # Convert to Python float
+                "smoke_detected": smoke_detected_status,
+                "output_frame_available": output_frame is not None,
+                "sensor_readings": sensor_data  # Include all real-time sensor readings
+            })
+        else:
+            return jsonify({
+                "fire_confidence": float(fire_confidence),  # Convert to Python float
+                "sensor_confidence": 0.0,
+                "adjusted_confidence": float(fire_confidence * 0.7),  # Convert to Python float
+                "smoke_detected": smoke_detected_status,
+                "output_frame_available": output_frame is not None,
+                "error": "No sensor data available."
+            }), 200
+    except Exception as e:
+        print(f"Error in /status endpoint: {e}")
         return jsonify({
-            "fire_confidence": fire_confidence,
-            "sensor_confidence": sensor_confidence,
-            "adjusted_confidence": adjusted_confidence,
-            "smoke_detected": smoke_detected_status,
-            "output_frame_available": output_frame is not None
-        })
-    else:
-        return jsonify({
-            "error": "Unable to fetch sensor data from Firebase."
+            "error": "An error occurred while fetching the status.",
+            "details": str(e)
         }), 500
 
 
