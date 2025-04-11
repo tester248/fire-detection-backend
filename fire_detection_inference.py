@@ -11,6 +11,7 @@ import firebase_admin
 from firebase_admin import credentials, db
 import pandas as pd
 from flask_cors import CORS  # Add this import
+from twilio_alerts import check_thresholds_and_alert  # Import the alert utility
 
 # Load environment variables from .env file
 load_dotenv()
@@ -37,7 +38,7 @@ stop_thread = False
 model = None
 # Load the trained sensor model
 sensor_model = joblib.load('models/sensor_fire_model.pkl')
-current_model_path = 'models/v8n50epoch.pt'
+current_model_path = 'models/best.pt'
 
 # Global variables for JSON response
 fire_confidence = 0.0
@@ -182,6 +183,7 @@ def index():
                 {% endfor %}
             </select><br><br>
             <button type="submit">Start Detection</button>
+            <button type="button" id="stopButton" onclick="stopDetection()" style="background-color: #f44336; display: none;">Stop Detection</button>
         </form>
         <div id="streamContainer" style="display: none;">
             <h2>Live Output Stream:</h2>
@@ -201,12 +203,27 @@ def index():
                     if (response.ok) {
                         const streamContainer = document.getElementById('streamContainer');
                         const videoFeed = document.getElementById('videoFeed');
+                        const stopButton = document.getElementById('stopButton');
                         videoFeed.src = '/video_feed';
                         streamContainer.style.display = 'block';
+                        stopButton.style.display = 'inline-block';
                     } else {
                         alert('Error starting detection');
                     }
                 }).catch(error => console.error('Error:', error));
+            }
+
+            function stopDetection() {
+                fetch('/stop')
+                    .then(response => response.json())
+                    .then(data => {
+                        alert(data.message);
+                        // Reset the UI
+                        document.getElementById('streamContainer').style.display = 'none';
+                        document.getElementById('stopButton').style.display = 'none';
+                        document.getElementById('videoFeed').src = '';
+                    })
+                    .catch(error => console.error('Error:', error));
             }
 
             function changeModel(modelPath) {
@@ -261,8 +278,7 @@ def stop_detection():
     stop_thread = True
     if video_thread and video_thread.is_alive():
         video_thread.join()
-    return "Fire detection stopped!"
-
+    return jsonify({"message": "Fire detection stopped!"})
 
 def fetch_sensor_data():
     """
@@ -330,6 +346,15 @@ def get_status():
 
             # Adjusted confidence (weighted average)
             adjusted_confidence = (fire_confidence * 0.7) + (sensor_confidence * 0.3)
+            
+            # Check thresholds and send alerts if necessary
+            location = request.args.get('location', 'Lab 607')
+            check_thresholds_and_alert(
+                fire_confidence=fire_confidence,
+                sensor_confidence=sensor_confidence,
+                adjusted_confidence=adjusted_confidence,
+                location=location
+            )
 
             return jsonify({
                 "fire_confidence": float(fire_confidence),  # Convert to Python float

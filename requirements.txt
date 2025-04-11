@@ -11,3 +11,4 @@ roboflow
 python-dotenv
 firebase-admin
 flask_cors
+twilio
