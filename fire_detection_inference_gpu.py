@@ -12,8 +12,17 @@ from firebase_admin import credentials, db
 import pandas as pd
 from flask_cors import CORS  # Add this import
 from twilio_alerts import check_thresholds_and_alert  # Import the alert utility
-import re  # Add this for URL validation
+import torch
+from threading import Lock
+import threading
 
+last_sensor_data = None
+sensor_data_lock = Lock()
+stop_sensor_thread = False
+
+device = "0" if torch.cuda.is_available() else "cpu"
+if device == "0":
+    torch.cuda.set_device(0)
 # Load environment variables from .env file
 load_dotenv()
 
@@ -48,15 +57,23 @@ smoke_detected_status = False
 def load_model(model_path):
     global model
     try:
+        # Load the YOLO model, it will automatically use CUDA if available
+        #model = YOLO(model_path)
+        print("Device: ", device)
         model = YOLO(model_path)
-        print(f"Model loaded successfully: {model_path}")
+        print("Before:", model.device.type)
+        results = model("Texture_Fire.jpg")
+        print("After: ", model.device.type)
+
+        print(f"Model loaded successfully: {model_path}, using device: {model.device}")
     except Exception as e:
         print(f"Error loading model: {e}")
 
 def detect_fire(frame):
-    global current_model_path, fire_confidence, smoke_detected_status
+    global current_model_path, fire_confidence, smoke_detected_status, device
     try:
-        results = model.predict(frame, verbose=False)
+        results = model.predict(frame, verbose=False, device=device)
+        #results = model.predict(frame, verbose=False)
         detections = results[0].boxes.data.cpu().numpy()
         fire_detected = False
         smoke_detected_status = False
@@ -101,129 +118,86 @@ def detect_fire(frame):
         smoke_detected_status = False
         return frame, False, False
 
+
+# --- Function to update sensor data periodically ---
+def update_sensor_data_periodically(interval=2):
+    global last_sensor_data, stop_sensor_thread
+    while not stop_sensor_thread:
+        data = fetch_sensor_data()
+        with sensor_data_lock:
+            last_sensor_data = data
+        time.sleep(interval)
+    print("Sensor update thread stopped.")
+
+
 def process_video(input_source):
-    global output_frame, stop_thread
+    global output_frame, stop_thread, last_sensor_data
     print(f"Attempting to open video source: {input_source}")
-    
-    # Check if input_source is a URL (http/https)
-    is_url = False
-    if isinstance(input_source, str) and (input_source.startswith('http://') or input_source.startswith('https://')):
-        is_url = True
-        print(f"Using HTTP stream URL: {input_source}")
+
     # Check if input_source is a digit (webcam device index)
-    elif isinstance(input_source, str) and input_source.isdigit():
+    if isinstance(input_source, str) and input_source.isdigit():
         input_source = int(input_source)
         print(f"Using webcam device index: {input_source}")
-    
-    # For OpenCV, pass URL as is, don't convert to int
+
     cap = cv2.VideoCapture(input_source)
-    
-    # Try to set webcam properties if we're using a webcam (not for HTTP streams)
-    if isinstance(input_source, int):
-        # Try different resolutions
+    if isinstance(input_source, int):  # If using a webcam, set properties
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer size for real-time processing
-    
+
     if not cap.isOpened():
         print(f"Error: Unable to open video source: {input_source}")
-        # Debug info for webcam
-        if isinstance(input_source, int) or (isinstance(input_source, str) and input_source.isdigit()):
-            print("Webcam troubleshooting:")
-            # List available cameras on Windows
-            for i in range(10):  # Check first 10 indices
-                test_cap = cv2.VideoCapture(i)
-                if test_cap.isOpened():
-                    print(f"Camera index {i} is available")
-                    test_cap.release()
-                else:
-                    print(f"Camera index {i} is not available")
-            print("Try using a specific camera index from the available ones listed above")
-        elif is_url:
-            print("HTTP stream troubleshooting:")
-            print("1. Verify the URL is accessible in a browser or with a tool like VLC")
-            print("2. Check if the stream requires authentication")
-            print("3. Verify network connectivity to the streaming device")
-            print("4. Try adding a network buffer: cv2.CAP_PROP_BUFFERSIZE")
         return
 
-    # Try to explicitly set properties for better reliability, but only for webcams
-    if isinstance(input_source, int) or (isinstance(input_source, str) and input_source.isdigit()):
-        # Try multiple common webcam resolutions
-        for width, height in [(640, 480), (1280, 720), (320, 240)]:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            # Check if we can successfully read a frame with these settings
-            test_ret, test_frame = cap.read()
-            if test_ret:
-                print(f"Successfully configured camera at {width}x{height}")
-                break
-    
-    # For HTTP streams, try setting a larger buffer
-    if is_url:
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # Increase buffer for network streams
-        
-    frame_skip = 1
+    input_fps = cap.get(cv2.CAP_PROP_FPS)  # Get the input video FPS
+    frame_delay = 1 / input_fps if input_fps > 0 else 0  # Calculate delay between frames
+
+    frame_skip = 2
     frame_count = 0
     prev_time = time.time()  # Initialize time for FPS calculation
 
     print("Video capture started")
-    consecutive_errors = 0
-    max_consecutive_errors = 5
-    
     while not stop_thread:
-        try:
-            ret, frame = cap.read()
-            if not ret:
-                consecutive_errors += 1
-                print(f"Warning: Failed to read frame. Error {consecutive_errors}/{max_consecutive_errors}")
-                
-                # If too many consecutive errors, try reconnecting
-                if consecutive_errors >= max_consecutive_errors:
-                    print("Attempting to reconnect to video source...")
-                    cap.release()
-                    time.sleep(1)  # Wait before reconnecting
-                    cap = cv2.VideoCapture(input_source)
-                    if not cap.isOpened():
-                        print("Reconnection failed. Stopping thread.")
-                        break
-                    consecutive_errors = 0
-                    
-                time.sleep(0.1)  # Small delay before trying again
-                continue
-            
-            # Reset error counter on successful frame read
-            consecutive_errors = 0
-            
-            frame_count += 1
-            if frame_count % frame_skip != 0:
-                continue
+        ret, frame = cap.read()
+        if not ret:
+            print("Error: Failed to read frame from video source. Stopping thread.")
+            break
 
-            start_time = time.time()  # Start time for processing
-            frame = cv2.resize(frame, (640, 360))
-            processed_frame, fire_detected, smoke_detected = detect_fire(frame)
-            end_time = time.time()  # End time for processing
+        frame_count += 1
+        if frame_count % frame_skip != 0:
+            continue
 
-            # Calculate real-time FPS
-            fps = 1 / (end_time - prev_time)
-            prev_time = end_time
+        start_time = time.time()  # Start time for processing
+        frame = cv2.resize(frame, (640, 360))
+        processed_frame, fire_detected, smoke_detected = detect_fire(frame)
+        end_time = time.time()  # End time for processing
 
-            # Fetch live sensor data from Firebase
-            sensor_data = fetch_sensor_data()
-            sensor_confidence = 0.0
-            if sensor_data:
-                sensor_confidence = calculate_sensor_confidence(sensor_data)
+        # Calculate real-time FPS
+        fps = 1 / (end_time - prev_time)
+        prev_time = end_time
 
-            # Add FPS counter, fire confidence, and sensor confidence to the frame
-            cv2.putText(processed_frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(processed_frame, f"Fire Confidence: {fire_confidence:.2f}%", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.putText(processed_frame, f"Sensor Confidence: {sensor_confidence:.2f}%", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        # --- Fetch sensor data asynchronously ---
+        sensor_confidence = 0.0
+        current_sensor_data = None
+        with sensor_data_lock:  # Read the latest data safely
+            current_sensor_data = last_sensor_data
 
-            output_frame = processed_frame
-        except Exception as e:
-            print(f"Error in process_video: {e}")
-            time.sleep(0.1)  # Prevent CPU overload in case of repeated errors
-    
+        if current_sensor_data:
+            sensor_confidence = calculate_sensor_confidence(current_sensor_data)
+        # --- End sensor data modification ---
+
+        # Add FPS counter, fire confidence, and sensor confidence to the frame
+        cv2.putText(processed_frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(processed_frame, f"Fire Confidence: {fire_confidence:.2f}%", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(processed_frame, f"Sensor Confidence: {sensor_confidence:.2f}%", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+        output_frame = processed_frame
+
+        # Limit the output FPS to match the input FPS
+        processing_time = time.time() - start_time
+        if frame_delay > processing_time:
+            time.sleep(frame_delay - processing_time)
+
     cap.release()
     print("Video capture released")
 
@@ -253,10 +227,8 @@ def index():
         <title>Fire Detection</title>
         <h1>Fire Detection with YOLO</h1>
         <form id="startForm" method="post" onsubmit="startDetection(event)">
-            <label for="input_source">Input Source (Video file path, HTTP URL, or camera ID (0, 1, etc)):</label><br>
+            <label for="input_source">Input Source (Video file path or ESP32-CAM URL):</label><br>
             <input type="text" id="input_source" name="input_source" required><br><br>
-            <button type="button" onclick="useWebcam()">Use Default Webcam (0)</button>
-            <button type="button" onclick="useIPCamera()">Use Example IP Camera</button><br><br>
             <label for="model_selector">Select Model:</label><br>
             <select id="model_selector" name="model_selector" onchange="changeModel(this.value)">
                 {% for model in models %}
@@ -272,27 +244,11 @@ def index():
             <p>Direct Stream URL: <a href="/video_feed" target="_blank">/video_feed</a></p>
         </div>
         <script>
-            function useWebcam() {
-                document.getElementById('input_source').value = '0';
-            }
-            
-            function useIPCamera() {
-                // This is just an example - replace with a real HTTP camera stream URL
-                document.getElementById('input_source').value = 'http://example.com/video_stream';
-                alert('Replace this with your actual HTTP camera stream URL');
-            }
-            
             function startDetection(event) {
                 event.preventDefault();
                 const form = document.getElementById('startForm');
                 const formData = new FormData(form);
-                const inputSource = document.getElementById('input_source').value;
-                
-                // Validate URL format for HTTP sources
-                if (inputSource.startsWith('http://') || inputSource.startsWith('https://')) {
-                    console.log('Using HTTP stream source');
-                }
-                
+
                 fetch('/start', {
                     method: 'POST',
                     body: formData
@@ -301,7 +257,7 @@ def index():
                         const streamContainer = document.getElementById('streamContainer');
                         const videoFeed = document.getElementById('videoFeed');
                         const stopButton = document.getElementById('stopButton');
-                        videoFeed.src = '/video_feed?_=' + new Date().getTime(); // Add cache buster
+                        videoFeed.src = '/video_feed';
                         streamContainer.style.display = 'block';
                         stopButton.style.display = 'inline-block';
                     } else {
@@ -329,8 +285,8 @@ def index():
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ model_path: modelPath })
                 }).then(response => response.json())
-                  .then(data => alert(data.message))
-                  .catch(error => console.error('Error:', error));
+                    .then(data => alert(data.message))
+                    .catch(error => console.error('Error:', error));
             }
         </script>
     ''', models=model_files, current_model=os.path.basename(current_model_path))
@@ -339,18 +295,7 @@ def index():
 def start_detection():
     global video_thread, stop_thread
     input_source = request.form['input_source']
-    
-    # Validate input source
-    if input_source.startswith('http://') or input_source.startswith('https://'):
-        # It's an HTTP source, keep as string
-        print(f"Starting detection with HTTP source: {input_source}")
-    elif input_source.isdigit():
-        # It's a camera index, convert to int
-        input_source = int(input_source)
-        print(f"Starting detection with camera index: {input_source}")
-    else:
-        # It's a file path or other source
-        print(f"Starting detection with source: {input_source}")
+    print(f"Starting detection with input source: {input_source}")
 
     if video_thread and video_thread.is_alive():
         stop_thread = True
@@ -454,7 +399,7 @@ def get_status():
 
             # Adjusted confidence (weighted average)
             adjusted_confidence = (fire_confidence * 0.7) + (sensor_confidence * 0.3)
-            
+
             # Check thresholds and send alerts if necessary
             location = request.args.get('location', 'Lab 607')
             check_thresholds_and_alert(
@@ -465,7 +410,7 @@ def get_status():
             )
 
             return jsonify({
-                "fire_confidence": float(fire_confidence),  # Convert to Python float
+                "fire_confidence": float(fire_confidence),  # Convert to Python
                 "sensor_confidence": float(sensor_confidence),  # Convert to Python float
                 "adjusted_confidence": float(adjusted_confidence),  # Convert to Python float
                 "smoke_detected": smoke_detected_status,
@@ -491,4 +436,21 @@ def get_status():
 
 if __name__ == "__main__":
     load_model(current_model_path)
-    app.run(host='0.0.0.0', port=5000, debug=False)
+
+    # --- Start sensor thread ---
+    stop_sensor_thread = False
+    sensor_thread = threading.Thread(target=update_sensor_data_periodically, args=(2,)) # Update every 2 seconds
+    sensor_thread.daemon = True
+    sensor_thread.start()
+    # --- End start sensor thread ---
+
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=False)
+    finally:
+         # --- Stop sensor thread on exit ---
+         print("Stopping sensor thread...")
+         stop_sensor_thread = True
+         if sensor_thread.is_alive():
+             sensor_thread.join(timeout=3) # Wait max 3 seconds
+         print("Sensor thread finished.")
+         # --- End stop sensor thread ---
